@@ -1,11 +1,27 @@
+"""
+References:
+- https://eli.thegreenplace.net/2015/calling-back-into-python-from-llvmlite-jited-code/
+- http://www.vishalchovatiya.com/memory-layout-of-cpp-object/
+- https://adventures.michaelfbryan.com/posts/rust-closures-in-ffi/
+- https://adventures.michaelfbryan.com/posts/ffi-safe-polymorphism-in-rust/
+"""
+
 import ctypes
 import typing as t
+from dataclasses import dataclass
 
 from llvmlite import ir, binding as llvm
 from graphql.execution import ExecutionContext
 from graphql.language.ast import FieldNode
 from graphql.pyutils.path import Path
-from graphql.type import GraphQLSchema, GraphQLObjectType, is_non_null_type
+from graphql.type import (
+    GraphQLSchema,
+    GraphQLObjectType,
+    is_non_null_type,
+    is_scalar_type,
+    get_nullable_type,
+    is_object_type,
+)
 
 _bool_ty = ir.IntType(1)
 _i32 = ir.IntType(32)
@@ -27,13 +43,74 @@ def _get_execution_engine():
     return _execution_engine
 
 
-"""
-References:
-- https://eli.thegreenplace.net/2015/calling-back-into-python-from-llvmlite-jited-code/
-- http://www.vishalchovatiya.com/memory-layout-of-cpp-object/
-- https://adventures.michaelfbryan.com/posts/rust-closures-in-ffi/
-- https://adventures.michaelfbryan.com/posts/ffi-safe-polymorphism-in-rust/
-"""
+@dataclass
+class Field:
+    name: str
+    resolver: t.Callable[..., t.Any]
+    nullable: bool
+
+
+@dataclass
+class ScalarField(Field):
+    pass
+
+
+@dataclass
+class ObjectField(Field):
+    selection: t.Dict[str, Field]
+
+
+def convert_graphql_query(
+    root_type: GraphQLObjectType, fields: t.List[FieldNode]
+) -> ObjectField:
+    def _convert_graphql_query(
+        root_type: GraphQLObjectType, fields: t.List[FieldNode]
+    ) -> t.Dict[str, Field]:
+        selection = {}
+
+        for field in fields:
+            name = field.name.value
+            alias = field.alias.value if field.alias else name
+            field_def = root_type.fields[name]
+            type_ = field_def.type
+            resolver = field_def.resolve
+            nullable = True
+
+            if is_non_null_type(type_):
+                type_ = get_nullable_type(type_)
+                nullable = False
+
+            sel: Field
+            if is_scalar_type(type_):
+                assert field.selection_set is None
+                sel = ScalarField(
+                    name=name,
+                    resolver=resolver,
+                    nullable=nullable,
+                )
+            elif is_object_type(type_):
+                assert field.selection_set is not None
+                sel = ObjectField(
+                    name=name,
+                    resolver=resolver,
+                    nullable=nullable,
+                    selection=_convert_graphql_query(
+                        type_, field.selection_set.selections
+                    ),
+                )
+            else:
+                raise NotImplementedError(type_)
+
+            selection[alias] = sel
+
+        return selection
+
+    return ObjectField(
+        name="query",
+        resolver=lambda root, info: root,
+        nullable=True,
+        selection=_convert_graphql_query(root_type, fields),
+    )
 
 
 class JITExecutionContext(ExecutionContext):
@@ -45,27 +122,27 @@ class JITExecutionContext(ExecutionContext):
         fields: t.Dict[str, t.List[FieldNode]],
     ):
         # FIXME: Cache the compiled queries
-        selection = [(alias, fields[0]) for alias, fields in fields.items()]
-        compiler = _Compiler(self.schema)
+        selection = convert_graphql_query(
+            parent_type, [field for (field,) in fields.values()]
+        )
+        compiler = _Compiler()
         compiled_ir = compiler.compile(selection)
         print(compiled_ir)
 
 
 class _Compiler:
-    def __init__(self, schema: GraphQLSchema):
+    def __init__(self):
         self._engine = _get_execution_engine()
-        self._schema = schema
         self._ir_context = ir.Context()
         self._module = ir.Module(context=self._ir_context)
 
-    def compile(self, selection: t.List[t.Tuple[str, FieldNode]]):
-        query_type = self._schema.query_type
-        assert query_type is not None
-        top_func, result_struct = self._compile(query_type, selection)
+    def compile(self, query: ObjectField):
+        top_func, result_struct = self._compile(query)
         module = llvm.parse_assembly(str(self._module))
         module.verify()
         tm = llvm.Target.from_default_triple().create_target_machine()
         tm.set_asm_verbosity(True)
+        print(str(self._module))
         print(tm.emit_assembly(module))
         return
         self._engine.add_module(module)
@@ -82,40 +159,21 @@ class _Compiler:
         return opaque_struct.as_pointer()
 
     # FIXME: maintain path to where we're at for compilation error reporting
-    def _compile(
-        self,
-        root_type: GraphQLObjectType,
-        selection: t.List[t.Tuple[str, FieldNode]],
-    ):
-        return self._compile_selection("query", root_type, selection)
+    def _compile(self, query: ObjectField):
+        return self._compile_selection("query", query)
 
-    def _compile_selection(
-        self,
-        field_name: str,
-        root_type: GraphQLObjectType,
-        selection: t.List[t.Tuple[str, FieldNode]],
-    ):
+    def _compile_selection(self, outer_alias: str, selection: ObjectField):
         struct_fields = []
         functions = {}
 
-        for alias, field in selection:
-            if not field.selection_set:
+        for alias, field in selection.selection.items():
+            if isinstance(field, ScalarField):
                 struct_fields.append((alias, self._py_object))
-            else:
-                assert all(
-                    isinstance(sel, FieldNode) for sel in field.selection_set.selections
-                )
-                field_type = root_type.fields[field.name.value].type
-                functions[alias], struct_ty = self._compile_selection(
-                    alias,
-                    field_type.of_type if is_non_null_type(field_type) else field_type,
-                    [
-                        (f.alias.value if f.alias else f.name.value, f)
-                        for f in field.selection_set.selections
-                        if isinstance(f, FieldNode)
-                    ],
-                )
+            elif isinstance(field, ObjectField):
+                functions[alias], struct_ty = self._compile_selection(alias, field)
                 struct_fields.append((alias, struct_ty))
+            else:
+                raise NotImplementedError(field)
 
         field_indices = {name: i for i, (name, _ty) in enumerate(struct_fields)}
         field_types = [ty for _name, ty in struct_fields]
@@ -124,23 +182,25 @@ class _Compiler:
         func_ty = ir.FunctionType(
             _bool_ty, (struct_ty.as_pointer(), self._py_object, self._py_object)
         )
-        func = ir.Function(self._module, func_ty, f"execute_{field_name}")
+        func = ir.Function(self._module, func_ty, f"execute_{outer_alias}")
         irbuilder = ir.IRBuilder(func.append_basic_block("entry"))
         ret_struct, root, info = func.args
         ret_struct.name = "field_values"
         root.name = "root"
         info.name = "info"
 
-        for alias, field in selection:
-            if not field.selection_set:
-                val = self._py_object(None)  # FIXME: actually resolve field
-            else:
+        for alias, field in selection.selection.items():
+            block = irbuilder.append_basic_block(alias)
+            irbuilder.branch(block)
+            irbuilder.position_at_start(block)
+            val = self._py_object(None)  # FIXME: actually resolve field
+            if isinstance(field, ObjectField):
                 field_struct_ptr = irbuilder.alloca(
                     field_types[field_indices[alias]], name=f"{alias}_fields_ptr"
                 )
                 ok = irbuilder.call(
                     functions[alias],
-                    [field_struct_ptr, self._py_object(None), self._py_object(None)],
+                    [field_struct_ptr, val, self._py_object(None)],
                     name=f"{alias}_ok",
                 )
                 with irbuilder.if_then(irbuilder.not_(ok), likely=False):
