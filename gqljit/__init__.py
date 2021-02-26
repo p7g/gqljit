@@ -255,6 +255,9 @@ class _Compiler:
         kwargs.name = "kwargs"
 
         irbuilder = ir.IRBuilder(func.append_basic_block("entry"))
+        is_mapping_block = func.append_basic_block("check_is_mapping")
+        irbuilder.branch(is_mapping_block)
+        irbuilder.position_at_end(is_mapping_block)
 
         is_mapping = irbuilder.trunc(
             irbuilder.call(self._pyapi.PyMapping_Check, [source]),
@@ -263,48 +266,48 @@ class _Compiler:
         )
         with irbuilder.if_else(is_mapping) as (then, else_):
             with then:
-                val1 = irbuilder.call(
+                then_val = irbuilder.call(
                     self._pyapi.PyMapping_GetItemString, [source, field_name]
                 )
                 then_block = irbuilder.block
+                then_block.name = "is_mapping"
             with else_:
-                val2 = irbuilder.call(
+                else_val = irbuilder.call(
                     self._pyapi.PyObject_GetAttrString, [source, field_name]
                 )
                 else_block = irbuilder.block
+                else_block.name = "is_not_mapping"
 
+        irbuilder.block.name = "check_no_value"
         val = irbuilder.phi(self._py_object, name="value")
-        val.add_incoming(val1, then_block)
-        val.add_incoming(val2, else_block)
+        val.add_incoming(then_val, then_block)
+        val.add_incoming(else_val, else_block)
 
-        with irbuilder.if_else(
+        with irbuilder.if_then(
             irbuilder.icmp_unsigned("==", val, self._py_object(None)),
             likely=False,
-        ) as (then, else_):
-            with then:
-                val1 = irbuilder.load(self._pyapi.Py_None)
-                then_block = irbuilder.block
-            with else_:
-                is_callable = irbuilder.trunc(
-                    irbuilder.call(self._pyapi.PyCallable_Check, [val]), _bool_ty
-                )
-                else_block = irbuilder.block
-                with irbuilder.if_then(is_callable):
-                    args = irbuilder.call(
-                        self._pyapi.PyTuple_Pack, [ir.IntType(64)(1), info]
-                    )
-                    val2 = irbuilder.call(
-                        self._pyapi.PyObject_Call, [val, args, kwargs]
-                    )
-                    other_else_block = irbuilder.block
-                else_phi = irbuilder.phi(self._py_object)
-                else_phi.add_incoming(val, else_block)
-                else_phi.add_incoming(val2, other_else_block)
-                other_other_block = irbuilder.block
+        ):
+            irbuilder.ret(irbuilder.load(self._pyapi.Py_None))
+            irbuilder.block.name = "no_value_for_field"
 
-        val = irbuilder.phi(self._py_object, name="value2")
-        val.add_incoming(val1, then_block)
-        val.add_incoming(else_phi, other_other_block)
+        irbuilder.block.name = "check_is_callable"
+        is_callable = irbuilder.trunc(
+            irbuilder.call(self._pyapi.PyCallable_Check, [val]),
+            _bool_ty,
+            name="is_callable",
+        )
+        prev_block = irbuilder.block
+        with irbuilder.if_then(is_callable):
+            args = irbuilder.call(self._pyapi.PyTuple_Pack, [ir.IntType(64)(1), info])
+            val2 = irbuilder.call(self._pyapi.PyObject_Call, [val, args, kwargs])
+            then_block = irbuilder.block
+            then_block.name = "call_it"
+
+        irbuilder.block.name = "return_value"
+        prev_val = val
+        val = irbuilder.phi(self._py_object)
+        val.add_incoming(prev_val, prev_block)
+        val.add_incoming(val2, then_block)
 
         irbuilder.ret(val)
 
