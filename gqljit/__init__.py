@@ -23,7 +23,10 @@ from graphql.type import (
     is_object_type,
 )
 
+from . import _pyapi
+
 _bool_ty = ir.IntType(1)
+_char_p = ir.IntType(8).as_pointer()
 _i32 = ir.IntType(32)
 _execution_engine = None
 
@@ -41,6 +44,13 @@ def _get_execution_engine():
     backing_module = llvm.parse_assembly("")
     _execution_engine = llvm.create_mcjit_compiler(backing_module, target_machine)
     return _execution_engine
+
+
+def cstr(b, bytes_: bytes):
+    ty = ir.ArrayType(ir.IntType(8), len(bytes_))
+    ptr = b.alloca(ty)
+    b.store(ty(bytearray(bytes_)), ptr)
+    return b.bitcast(ptr, _char_p)
 
 
 @dataclass
@@ -135,14 +145,15 @@ class _Compiler:
         self._engine = _get_execution_engine()
         self._ir_context = ir.Context()
         self._module = ir.Module(context=self._ir_context)
+        self._pyapi = _pyapi.make(self._ir_context, self._module)
 
     def compile(self, query: ObjectField):
         top_func, result_struct = self._compile(query)
+        print(str(self._module))
         module = llvm.parse_assembly(str(self._module))
         module.verify()
         tm = llvm.Target.from_default_triple().create_target_machine()
         tm.set_asm_verbosity(True)
-        print(str(self._module))
         print(tm.emit_assembly(module))
         return
         self._engine.add_module(module)
@@ -151,7 +162,7 @@ class _Compiler:
 
         execute_func_ptr = module.get_function_address("execute")
         # FIXME: use cffi instead of ctypes
-        return ctypes.CFUNCTYPE(ctypes.c_int)(execute_func_ptr)
+        return ctypes.PYFUNCTYPE(ctypes.c_int)(execute_func_ptr)
 
     @property
     def _py_object(self):
@@ -193,7 +204,16 @@ class _Compiler:
             block = irbuilder.append_basic_block(alias)
             irbuilder.branch(block)
             irbuilder.position_at_start(block)
-            val = self._py_object(None)  # FIXME: actually resolve field
+            resolver = self._get_default_resolver()  # FIXME: use real resolver
+            val = irbuilder.call(
+                resolver,
+                [
+                    root,
+                    cstr(irbuilder, field.name.encode("ascii")),
+                    info,
+                    irbuilder.call(self._pyapi.PyDict_New, []),
+                ],
+            )
             if isinstance(field, ObjectField):
                 field_struct_ptr = irbuilder.alloca(
                     field_types[field_indices[alias]], name=f"{alias}_fields_ptr"
@@ -217,3 +237,76 @@ class _Compiler:
         irbuilder.ret(_bool_ty(0))
 
         return func, struct_ty
+
+    def _get_default_resolver(self):
+        existing = getattr(self, "_default_resolver", None)
+        if existing:
+            return existing
+
+        func_ty = ir.FunctionType(
+            self._py_object,
+            (self._py_object, _char_p, self._py_object, self._py_object),
+        )
+        func = ir.Function(self._module, func_ty, "default_field_resolver")
+        source, field_name, info, kwargs = func.args
+        source.name = "source"
+        field_name.name = "field_name"
+        info.name = "info"
+        kwargs.name = "kwargs"
+
+        irbuilder = ir.IRBuilder(func.append_basic_block("entry"))
+
+        is_mapping = irbuilder.trunc(
+            irbuilder.call(self._pyapi.PyMapping_Check, [source]),
+            _bool_ty,
+            name="is_mapping",
+        )
+        with irbuilder.if_else(is_mapping) as (then, else_):
+            with then:
+                val1 = irbuilder.call(
+                    self._pyapi.PyMapping_GetItemString, [source, field_name]
+                )
+                then_block = irbuilder.block
+            with else_:
+                val2 = irbuilder.call(
+                    self._pyapi.PyObject_GetAttrString, [source, field_name]
+                )
+                else_block = irbuilder.block
+
+        val = irbuilder.phi(self._py_object, name="value")
+        val.add_incoming(val1, then_block)
+        val.add_incoming(val2, else_block)
+
+        with irbuilder.if_else(
+            irbuilder.icmp_unsigned("==", val, self._py_object(None)),
+            likely=False,
+        ) as (then, else_):
+            with then:
+                val1 = irbuilder.load(self._pyapi.Py_None)
+                then_block = irbuilder.block
+            with else_:
+                is_callable = irbuilder.trunc(
+                    irbuilder.call(self._pyapi.PyCallable_Check, [val]), _bool_ty
+                )
+                else_block = irbuilder.block
+                with irbuilder.if_then(is_callable):
+                    args = irbuilder.call(
+                        self._pyapi.PyTuple_Pack, [ir.IntType(64)(1), info]
+                    )
+                    val2 = irbuilder.call(
+                        self._pyapi.PyObject_Call, [val, args, kwargs]
+                    )
+                    other_else_block = irbuilder.block
+                else_phi = irbuilder.phi(self._py_object)
+                else_phi.add_incoming(val, else_block)
+                else_phi.add_incoming(val2, other_else_block)
+                other_other_block = irbuilder.block
+
+        val = irbuilder.phi(self._py_object, name="value2")
+        val.add_incoming(val1, then_block)
+        val.add_incoming(else_phi, other_other_block)
+
+        irbuilder.ret(val)
+
+        self._default_resolver = func
+        return func
