@@ -287,7 +287,10 @@ class _Compiler:
             irbuilder.icmp_unsigned("==", val, self._py_object(None)),
             likely=False,
         ):
-            irbuilder.ret(irbuilder.load(self._pyapi.Py_None))
+            irbuilder.call(self._pyapi.PyErr_Clear, [])
+            none = self._pyapi.Py_None
+            irbuilder.call(self._pyapi.Py_IncRef, [none])
+            irbuilder.ret(none)
             irbuilder.block.name = "no_value_for_field"
 
         irbuilder.block.name = "check_is_callable"
@@ -298,8 +301,12 @@ class _Compiler:
         )
         prev_block = irbuilder.block
         with irbuilder.if_then(is_callable):
-            args = irbuilder.call(self._pyapi.PyTuple_Pack, [ir.IntType(64)(1), info])
-            val2 = irbuilder.call(self._pyapi.PyObject_Call, [val, args, kwargs])
+            args = self._pyapi.guarded_call(
+                irbuilder, self._pyapi.PyTuple_Pack, [ir.IntType(64)(1), info]
+            )
+            val2 = self._pyapi.guarded_call(
+                irbuilder, self._pyapi.PyObject_Call, [val, args, kwargs]
+            )
             then_block = irbuilder.block
             then_block.name = "call_it"
 
