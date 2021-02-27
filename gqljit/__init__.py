@@ -48,7 +48,7 @@ def _init_llvm_bindings() -> None:
 @dataclass
 class Field:
     name: str
-    resolver: t.Callable[..., t.Any]
+    resolver: t.Optional[t.Callable[..., t.Any]]
     nullable: bool
 
 
@@ -252,18 +252,35 @@ class Compiler:
             block = irbuilder.append_basic_block(alias)
             irbuilder.branch(block)
             irbuilder.position_at_start(block)
-            resolver = self._get_default_resolver()  # FIXME: use real resolver
-            val = self._pyapi.guarded_call(
-                irbuilder,
-                resolver,
-                [
-                    root,
-                    cstr(irbuilder, f"{field.name}\0".encode("ascii")),
-                    info,
-                    irbuilder.call(self._pyapi.PyDict_New, []),
-                ],
-                ret_on_err=_bool_ty(1),
-            )
+            if field.resolver is not None:
+                resolver = irbuilder.inttoptr(
+                    ir.IntType(64)(id(field.resolver)), self._pyapi.PyObject
+                )
+                args = self._pyapi.guarded_call(
+                    irbuilder,
+                    self._pyapi.PyTuple_Pack,
+                    [ir.IntType(64)(2), root, info],
+                    ret_on_err=_bool_ty(1),
+                )
+                val = self._pyapi.guarded_call(
+                    irbuilder,
+                    self._pyapi.PyObject_Call,
+                    [resolver, args, self._pyapi.PyObject(None)],
+                    ret_on_err=_bool_ty(1),
+                )
+            else:
+                resolver = self._get_default_resolver()
+                val = self._pyapi.guarded_call(
+                    irbuilder,
+                    resolver,
+                    [
+                        root,
+                        cstr(irbuilder, f"{field.name}\0".encode("ascii")),
+                        info,
+                        irbuilder.call(self._pyapi.PyDict_New, []),
+                    ],
+                    ret_on_err=_bool_ty(1),
+                )
             field_ptr = irbuilder.gep(
                 ret_struct,
                 [_i32(0), _i32(field_indices[alias])],
@@ -274,9 +291,7 @@ class Compiler:
                 irbuilder.store(val, field_ptr)
             elif isinstance(field, ObjectField):
                 failed = irbuilder.call(
-                    functions[alias],
-                    [field_ptr, val, self._pyapi.PyObject(None)],
-                    name=f"{alias}_ok",
+                    functions[alias], [field_ptr, val, info], name=f"{alias}_ok"
                 )
                 with irbuilder.if_then(failed, likely=False):
                     irbuilder.ret(failed)

@@ -9,8 +9,8 @@ A lot.
 - [ ] Code generation
   - [x] Structs to hold query results
   - [x] Functions to execute query
-  - [ ] Call into Python to run resolvers
-    - [ ] Get pointers to Python functions callable by JIT-compiled code
+  - [x] Call into Python to run resolvers
+    - [x] Get pointers to Python functions callable by JIT-compiled code
   - [x] Default resolver (for scalars without defined resolvers)
   - [ ] Lists
   - [ ] Handle nullability

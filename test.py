@@ -11,11 +11,10 @@ schema = g.GraphQLSchema(
                     fields={
                         "Hello": g.GraphQLField(
                             g.GraphQLString,
-                            resolve=lambda root, info: "World",
+                            resolve=lambda root, info: root["Hello"].upper(),
                         ),
                     },
                 ),
-                resolve=lambda root, info: None,
             ),
         },
     ),
