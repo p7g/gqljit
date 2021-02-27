@@ -15,7 +15,6 @@ from graphql.execution import ExecutionContext
 from graphql.language.ast import FieldNode
 from graphql.pyutils.path import Path
 from graphql.type import (
-    GraphQLSchema,
     GraphQLObjectType,
     is_non_null_type,
     is_scalar_type,
@@ -24,33 +23,26 @@ from graphql.type import (
 )
 
 from . import _pyapi
+from ._utils import once, cstr
+
+__all__ = [
+    "Field",
+    "ScalarField",
+    "ObjectField",
+    "JITExecutionContext",
+    "Compiler",
+]
 
 _bool_ty = ir.IntType(1)
 _char_p = ir.IntType(8).as_pointer()
 _i32 = ir.IntType(32)
-_execution_engine = None
 
 
-def _get_execution_engine():
-    global _execution_engine
-
-    if _execution_engine:
-        return _execution_engine
-
+@once
+def _init_llvm_bindings() -> None:
     llvm.initialize()
     llvm.initialize_native_target()
     llvm.initialize_native_asmprinter()
-    target_machine = llvm.Target.from_default_triple().create_target_machine()
-    backing_module = llvm.parse_assembly("")
-    _execution_engine = llvm.create_mcjit_compiler(backing_module, target_machine)
-    return _execution_engine
-
-
-def cstr(b, bytes_: bytes):
-    ty = ir.ArrayType(ir.IntType(8), len(bytes_))
-    ptr = b.alloca(ty)
-    b.store(ty(bytearray(bytes_)), ptr)
-    return b.bitcast(ptr, _char_p)
 
 
 @dataclass
@@ -123,6 +115,19 @@ def convert_graphql_query(
     )
 
 
+def _result_struct_to_dict(query: ObjectField, struct):
+    result = {}
+    for alias, field in query.selection.items():
+        value = getattr(struct, alias)
+        if isinstance(field, ScalarField):
+            result[alias] = value
+        elif isinstance(field, ObjectField):
+            result[alias] = _result_struct_to_dict(field, value)
+        else:
+            raise NotImplementedError(field)
+    return result
+
+
 class JITExecutionContext(ExecutionContext):
     def execute_fields(
         self,
@@ -135,43 +140,85 @@ class JITExecutionContext(ExecutionContext):
         selection = convert_graphql_query(
             parent_type, [field for (field,) in fields.values()]
         )
-        compiler = _Compiler()
-        compiled_ir = compiler.compile(selection)
-        print(compiled_ir)
+        compiler = Compiler()
+        resolver = compiler.compile(selection)
+        return resolver(source_value, None)
 
 
-class _Compiler:
+class Compiler:
     def __init__(self):
-        self._engine = _get_execution_engine()
+        _init_llvm_bindings()
+        self._target_machine = llvm.Target.from_default_triple().create_target_machine()
+        self._engine = llvm.create_mcjit_compiler(
+            llvm.parse_assembly(""), self._target_machine
+        )
         self._ir_context = ir.Context()
         self._module = ir.Module(context=self._ir_context)
         self._pyapi = _pyapi.make(self._ir_context, self._module)
 
     def compile(self, query: ObjectField):
-        top_func, result_struct = self._compile(query)
-        print(str(self._module))
+        pyfunc = self._compile(query)
+        # print(self.llvm_ir)
+        # print(self.asm())
+        return pyfunc
+
+    @property
+    def engine(self):
+        return self._engine
+
+    @property
+    def llvm_ir(self) -> str:
+        return str(self._module)
+
+    def asm(self, verbose=True) -> str:
+        self._target_machine.set_asm_verbosity(verbose)
+        asm: str = self._target_machine.emit_assembly(llvm.parse_assembly(self.llvm_ir))
+        return asm
+
+    def finalize(self):
         module = llvm.parse_assembly(str(self._module))
         module.verify()
-        tm = llvm.Target.from_default_triple().create_target_machine()
-        tm.set_asm_verbosity(True)
-        print(tm.emit_assembly(module))
-        return
         self._engine.add_module(module)
         self._engine.finalize_object()
         self._engine.run_static_constructors()
 
-        execute_func_ptr = module.get_function_address("execute")
-        # FIXME: use cffi instead of ctypes
-        return ctypes.PYFUNCTYPE(ctypes.c_int)(execute_func_ptr)
-
-    @property
-    def _py_object(self):
-        opaque_struct = self._ir_context.get_identified_type("PyObject")
-        return opaque_struct.as_pointer()
+    def _make_ctypes_struct(self, query: ObjectField) -> ctypes.Structure:
+        name = query.name
+        fields = []
+        for alias, field in query.selection.items():
+            if isinstance(field, ScalarField):
+                fields.append((alias, ctypes.py_object))
+            elif isinstance(field, ObjectField):
+                fields.append((alias, self._make_ctypes_struct(field)))
+            else:
+                raise NotImplementedError(field)
+        return t.cast(
+            ctypes.Structure, type(name, (ctypes.Structure,), {"_fields_": fields})
+        )
 
     # FIXME: maintain path to where we're at for compilation error reporting
     def _compile(self, query: ObjectField):
-        return self._compile_selection("query", query)
+        top_func, result_ty = self._compile_selection("query", query)
+        # Generate a ctypes struct for result_ty
+        # Wrap top_func in `def run(root, info, *args, **kwargs)`
+        ctypes_struct = self._make_ctypes_struct(query)
+        result = ctypes_struct()
+        self.finalize()
+        execute_func_ptr = self._engine.get_function_address(top_func.name)
+        adapter = ctypes.PYFUNCTYPE(
+            ctypes.c_int,
+            ctypes.POINTER(ctypes_struct),
+            ctypes.py_object,
+            ctypes.py_object,
+        )(execute_func_ptr)
+
+        def wrapper(root, info, *args, **kwargs):
+            failed = adapter(ctypes.byref(result), root, info)
+            if failed:
+                raise Exception()
+            return _result_struct_to_dict(query, result)
+
+        return wrapper
 
     def _compile_selection(self, outer_alias: str, selection: ObjectField):
         struct_fields = []
@@ -179,7 +226,7 @@ class _Compiler:
 
         for alias, field in selection.selection.items():
             if isinstance(field, ScalarField):
-                struct_fields.append((alias, self._py_object))
+                struct_fields.append((alias, self._pyapi.PyObject))
             elif isinstance(field, ObjectField):
                 functions[alias], struct_ty = self._compile_selection(alias, field)
                 struct_fields.append((alias, struct_ty))
@@ -191,7 +238,8 @@ class _Compiler:
         struct_ty = ir.LiteralStructType(field_types)
 
         func_ty = ir.FunctionType(
-            _bool_ty, (struct_ty.as_pointer(), self._py_object, self._py_object)
+            _bool_ty,
+            (struct_ty.as_pointer(), self._pyapi.PyObject, self._pyapi.PyObject),
         )
         func = ir.Function(self._module, func_ty, f"execute_{outer_alias}")
         irbuilder = ir.IRBuilder(func.append_basic_block("entry"))
@@ -205,34 +253,35 @@ class _Compiler:
             irbuilder.branch(block)
             irbuilder.position_at_start(block)
             resolver = self._get_default_resolver()  # FIXME: use real resolver
-            val = irbuilder.call(
+            val = self._pyapi.guarded_call(
+                irbuilder,
                 resolver,
                 [
                     root,
-                    cstr(irbuilder, field.name.encode("ascii")),
+                    cstr(irbuilder, f"{field.name}\0".encode("ascii")),
                     info,
                     irbuilder.call(self._pyapi.PyDict_New, []),
                 ],
+                ret_on_err=_bool_ty(1),
             )
-            if isinstance(field, ObjectField):
-                field_struct_ptr = irbuilder.alloca(
-                    field_types[field_indices[alias]], name=f"{alias}_fields_ptr"
-                )
-                ok = irbuilder.call(
-                    functions[alias],
-                    [field_struct_ptr, val, self._py_object(None)],
-                    name=f"{alias}_ok",
-                )
-                with irbuilder.if_then(irbuilder.not_(ok), likely=False):
-                    irbuilder.ret(ok)
-                val = irbuilder.load(field_struct_ptr)
             field_ptr = irbuilder.gep(
                 ret_struct,
                 [_i32(0), _i32(field_indices[alias])],
                 inbounds=True,
                 name=f"{alias}_ptr",
             )
-            irbuilder.store(val, field_ptr)
+            if isinstance(field, ScalarField):
+                irbuilder.store(val, field_ptr)
+            elif isinstance(field, ObjectField):
+                failed = irbuilder.call(
+                    functions[alias],
+                    [field_ptr, val, self._pyapi.PyObject(None)],
+                    name=f"{alias}_ok",
+                )
+                with irbuilder.if_then(failed, likely=False):
+                    irbuilder.ret(failed)
+            else:
+                raise NotImplementedError(field)
 
         irbuilder.ret(_bool_ty(0))
 
@@ -244,8 +293,8 @@ class _Compiler:
             return existing
 
         func_ty = ir.FunctionType(
-            self._py_object,
-            (self._py_object, _char_p, self._py_object, self._py_object),
+            self._pyapi.PyObject,
+            (self._pyapi.PyObject, _char_p, self._pyapi.PyObject, self._pyapi.PyObject),
         )
         func = ir.Function(self._module, func_ty, "default_field_resolver")
         source, field_name, info, kwargs = func.args
@@ -279,12 +328,12 @@ class _Compiler:
                 else_block.name = "is_not_mapping"
 
         irbuilder.block.name = "check_no_value"
-        val = irbuilder.phi(self._py_object, name="value")
+        val = irbuilder.phi(self._pyapi.PyObject, name="value")
         val.add_incoming(then_val, then_block)
         val.add_incoming(else_val, else_block)
 
         with irbuilder.if_then(
-            irbuilder.icmp_unsigned("==", val, self._py_object(None)),
+            irbuilder.icmp_unsigned("==", val, self._pyapi.PyObject(None)),
             likely=False,
         ):
             irbuilder.call(self._pyapi.PyErr_Clear, [])
@@ -312,7 +361,7 @@ class _Compiler:
 
         irbuilder.block.name = "return_value"
         prev_val = val
-        val = irbuilder.phi(self._py_object)
+        val = irbuilder.phi(self._pyapi.PyObject)
         val.add_incoming(prev_val, prev_block)
         val.add_incoming(val2, then_block)
 

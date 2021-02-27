@@ -26,5 +26,6 @@ print(
         schema,
         "query { viewer { Hello } viewer2: viewer { Hello } }",
         execution_context_class=gqljit.JITExecutionContext,
+        root_value={"viewer": {"Hello": "world!"}},
     )
 )

@@ -1,5 +1,7 @@
 from llvmlite import ir
 
+from ._utils import cstr, printf
+
 int32 = ir.IntType(32)
 intptr = ir.IntType(64)  # FIXME
 c_str = ir.IntType(8).as_pointer()
@@ -7,7 +9,9 @@ c_str = ir.IntType(8).as_pointer()
 
 def make(ctx, mod):
     py_obj = ctx.get_identified_type("PyObject").as_pointer()
+    FILE_p = ctx.get_identified_type("FILE").as_pointer()
     null_obj = py_obj(None)
+    stdout = ir.GlobalVariable(mod, FILE_p, "stdout")
 
     def pyapi_func(name, ret, args, varargs=False):
         return ir.Function(mod, ir.FunctionType(ret, args, var_arg=varargs), name)
@@ -16,6 +20,8 @@ def make(ctx, mod):
         return ir.GlobalVariable(mod, type_, name)
 
     class _pyapi:
+        PyObject = py_obj
+
         PyMapping_Check = pyapi_func("PyMapping_Check", int32, [py_obj])
         PyMapping_GetItemString = pyapi_func(
             "PyMapping_GetItemString", py_obj, [py_obj, c_str]
@@ -25,6 +31,8 @@ def make(ctx, mod):
             "PyObject_GetAttrString", py_obj, [py_obj, c_str]
         )
         PyObject_Call = pyapi_func("PyObject_Call", py_obj, [py_obj, py_obj, py_obj])
+        PyObject_Repr = pyapi_func("PyObject_Repr", py_obj, [py_obj])
+        PyObject_Print = pyapi_func("PyObject_Print", int32, [py_obj, FILE_p, int32])
 
         PyCallable_Check = pyapi_func("PyCallable_Check", int32, [py_obj])
 
@@ -34,6 +42,12 @@ def make(ctx, mod):
         PyDict_SetItemString = pyapi_func(
             "PyDict_SetItemString", int32, [py_obj, c_str, py_obj]
         )
+
+        PyUnicode_AsEncodedString = pyapi_func(
+            "PyUnicode_AsEncodedString", py_obj, [py_obj, c_str, c_str]
+        )
+
+        PyBytes_AsString = pyapi_func("PyBytes_AsString", c_str, [py_obj])
 
         Py_None = global_var("_Py_NoneStruct", ctx.get_identified_type("PyObject"))
 
@@ -49,5 +63,11 @@ def make(ctx, mod):
             with b.if_then(is_null):
                 b.ret(ret_on_err)
             return result
+
+        @classmethod
+        def repr(cls, b, obj, ret_on_err=null_obj):
+            result = b.call(cls.PyObject_Print, [obj, b.load(stdout), int32(0)])
+            with b.if_then(b.trunc(result, ir.IntType(1))):
+                b.ret(ret_on_err)
 
     return _pyapi()
