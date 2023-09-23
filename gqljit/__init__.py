@@ -156,6 +156,8 @@ class Compiler:
         self._module = ir.Module(context=self._ir_context)
         self._pyapi = _pyapi.make(self._ir_context, self._module)
 
+        self._do_not_gc = []
+
     def compile(self, query: ObjectField):
         pyfunc = self._compile(query)
         # print(self.llvm_ir)
@@ -253,19 +255,12 @@ class Compiler:
             irbuilder.branch(block)
             irbuilder.position_at_start(block)
             if field.resolver is not None:
-                resolver = irbuilder.inttoptr(
-                    ir.IntType(64)(id(field.resolver)), self._pyapi.PyObject
-                )
-                args = self._pyapi.guarded_call(
-                    irbuilder,
-                    self._pyapi.PyTuple_Pack,
-                    [ir.IntType(64)(2), root, info],
-                    ret_on_err=_bool_ty(1),
-                )
+                callback_ptr, callback_ty = self._get_resolver_callback(field)
+                resolver = irbuilder.inttoptr(ir.IntType(64)(callback_ptr), callback_ty)
                 val = self._pyapi.guarded_call(
                     irbuilder,
-                    self._pyapi.PyObject_Call,
-                    [resolver, args, self._pyapi.PyObject(None)],
+                    resolver,
+                    [root, info],
                     ret_on_err=_bool_ty(1),
                 )
             else:
@@ -301,6 +296,14 @@ class Compiler:
         irbuilder.ret(_bool_ty(0))
 
         return func, struct_ty
+
+    def _get_resolver_callback(self, field):
+        # FIXME: Field arguments
+        proto = ctypes.CFUNCTYPE(ctypes.py_object, ctypes.py_object, ctypes.py_object)
+        callback = proto(field.resolver)
+        self._do_not_gc.append(callback)
+        llvm_type = ir.FunctionType(self._pyapi.PyObject, (self._pyapi.PyObject, self._pyapi.PyObject))
+        return ctypes.cast(callback, ctypes.c_void_p).value, llvm_type.as_pointer()
 
     def _get_default_resolver(self):
         existing = getattr(self, "_default_resolver", None)
