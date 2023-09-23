@@ -15,7 +15,7 @@ venv = Venv(
             pkgs={"mypy": "==0.812"},
         ),
         Venv(
-            pkgs={"black": "==20.8b1"},
+            pkgs={"black": "==23.9.1"},
             venvs=[
                 Venv(name="fmt", command=r"black --exclude '/\.riot/' ."),
                 Venv(name="black", command="black --exclude '/\.riot/' {cmdargs}"),

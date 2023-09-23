@@ -33,6 +33,7 @@ def make(ctx, mod):
         PyObject_Call = pyapi_func("PyObject_Call", py_obj, [py_obj, py_obj, py_obj])
         PyObject_Repr = pyapi_func("PyObject_Repr", py_obj, [py_obj])
         PyObject_Print = pyapi_func("PyObject_Print", int32, [py_obj, FILE_p, int32])
+        PyObject_Type = pyapi_func("PyObject_Type", py_obj, [py_obj])
 
         PyCallable_Check = pyapi_func("PyCallable_Check", int32, [py_obj])
 
@@ -49,17 +50,29 @@ def make(ctx, mod):
 
         PyBytes_AsString = pyapi_func("PyBytes_AsString", c_str, [py_obj])
 
-        Py_None = global_var("_Py_NoneStruct", ctx.get_identified_type("PyObject"))
+        Py_None = global_var("_Py_NoneStruct", py_obj.pointee)
 
         Py_IncRef = pyapi_func("Py_IncRef", ir.VoidType(), [py_obj])
         Py_DecRef = pyapi_func("Py_DecRef", ir.VoidType(), [py_obj])
 
         PyErr_Clear = pyapi_func("PyErr_Clear", ir.VoidType(), [])
+        PyErr_GivenExceptionMatches = pyapi_func(
+            "PyErr_GivenExceptionMatches", ir.IntType(1), [py_obj, py_obj]
+        )
+        PyErr_Restore = pyapi_func(
+            "PyErr_Restore", ir.VoidType(), [py_obj, py_obj, py_obj]
+        )
+        PyException_GetTraceback = pyapi_func(
+            "PyException_GetTraceback", py_obj, [py_obj]
+        )
+
+        PyExc_BaseException = global_var("PyExc_BaseException", py_obj)
+        PyExc_Exception = global_var("PyExc_Exception", py_obj)
 
         @staticmethod
-        def guarded_call(b, fn, args, ret_on_err=null_obj):
+        def guarded_call(b, fn, args, ret_on_err=null_obj, error_sentinel=null_obj):
             result = b.call(fn, args)
-            is_null = b.icmp_unsigned("==", result, null_obj)
+            is_null = b.icmp_unsigned("==", result, error_sentinel)
             with b.if_then(is_null):
                 b.ret(ret_on_err)
             return result
@@ -69,5 +82,13 @@ def make(ctx, mod):
             result = b.call(cls.PyObject_Print, [obj, b.load(stdout), int32(0)])
             with b.if_then(b.trunc(result, ir.IntType(1))):
                 b.ret(ret_on_err)
+
+        @classmethod
+        def incref(cls, b, obj):
+            return b.call(cls.Py_IncRef, [obj])
+
+        @classmethod
+        def decref(cls, b, obj):
+            return b.call(cls.Py_DecRef, [obj])
 
     return _pyapi()

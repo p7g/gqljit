@@ -7,6 +7,7 @@ References:
 """
 
 import ctypes
+import itertools
 import typing as t
 from dataclasses import dataclass
 
@@ -115,19 +116,6 @@ def convert_graphql_query(
     )
 
 
-def _result_struct_to_dict(query: ObjectField, struct):
-    result = {}
-    for alias, field in query.selection.items():
-        value = getattr(struct, alias)
-        if isinstance(field, ScalarField):
-            result[alias] = value
-        elif isinstance(field, ObjectField):
-            result[alias] = _result_struct_to_dict(field, value)
-        else:
-            raise NotImplementedError(field)
-    return result
-
-
 class JITExecutionContext(ExecutionContext):
     def execute_fields(
         self,
@@ -184,125 +172,184 @@ class Compiler:
         self._engine.finalize_object()
         self._engine.run_static_constructors()
 
-    def _make_ctypes_struct(self, query: ObjectField) -> ctypes.Structure:
-        name = query.name
-        fields = []
-        for alias, field in query.selection.items():
-            if isinstance(field, ScalarField):
-                fields.append((alias, ctypes.py_object))
-            elif isinstance(field, ObjectField):
-                fields.append((alias, self._make_ctypes_struct(field)))
-            else:
-                raise NotImplementedError(field)
-        return t.cast(
-            ctypes.Structure, type(name, (ctypes.Structure,), {"_fields_": fields})
-        )
-
     # FIXME: maintain path to where we're at for compilation error reporting
     def _compile(self, query: ObjectField):
-        top_func, result_ty = self._compile_selection("query", query)
-        # Generate a ctypes struct for result_ty
-        # Wrap top_func in `def run(root, info, *args, **kwargs)`
-        ctypes_struct = self._make_ctypes_struct(query)
-        result = ctypes_struct()
+        top_func = self._compile_selection("query", query)
         self.finalize()
+
         execute_func_ptr = self._engine.get_function_address(top_func.name)
         adapter = ctypes.PYFUNCTYPE(
-            ctypes.c_int,
-            ctypes.POINTER(ctypes_struct),
+            ctypes.py_object,
             ctypes.py_object,
             ctypes.py_object,
         )(execute_func_ptr)
 
         def wrapper(root, info, *args, **kwargs):
-            failed = adapter(ctypes.byref(result), root, info)
-            if failed:
-                raise Exception()
-            return _result_struct_to_dict(query, result)
+            return adapter(root, info)
 
         return wrapper
 
     def _compile_selection(self, outer_alias: str, selection: ObjectField):
-        struct_fields = []
         functions = {}
 
         for alias, field in selection.selection.items():
             if isinstance(field, ScalarField):
-                struct_fields.append((alias, self._pyapi.PyObject))
+                pass
             elif isinstance(field, ObjectField):
-                functions[alias], struct_ty = self._compile_selection(alias, field)
-                struct_fields.append((alias, struct_ty))
+                functions[alias] = self._compile_selection(alias, field)
             else:
                 raise NotImplementedError(field)
 
-        field_indices = {name: i for i, (name, _ty) in enumerate(struct_fields)}
-        field_types = [ty for _name, ty in struct_fields]
-        struct_ty = ir.LiteralStructType(field_types)
-
         func_ty = ir.FunctionType(
-            _bool_ty,
-            (struct_ty.as_pointer(), self._pyapi.PyObject, self._pyapi.PyObject),
+            self._pyapi.PyObject,
+            (self._pyapi.PyObject, self._pyapi.PyObject),
         )
         func = ir.Function(self._module, func_ty, f"execute_{outer_alias}")
         irbuilder = ir.IRBuilder(func.append_basic_block("entry"))
-        ret_struct, root, info = func.args
-        ret_struct.name = "field_values"
+        root, info = func.args
         root.name = "root"
         info.name = "info"
 
-        for alias, field in selection.selection.items():
-            block = irbuilder.append_basic_block(alias)
-            irbuilder.branch(block)
-            irbuilder.position_at_start(block)
+        aliases = list(selection.selection)
+        alias_blocks = {alias: irbuilder.append_basic_block(alias) for alias in aliases}
+        end_block = irbuilder.append_basic_block("end")
+
+        result_dict = self._pyapi.guarded_call(irbuilder, self._pyapi.PyDict_New, [])
+        irbuilder.branch(alias_blocks[aliases[0]])
+
+        # FIXME: Py_EnterRecursiveCall?
+        for alias, next_alias in itertools.pairwise(aliases + [None]):
+            assert isinstance(alias, str)
+            assert isinstance(next_alias, (str, type(None)))
+
+            block = alias_blocks[alias]
+            next_block = alias_blocks[next_alias] if next_alias else end_block
+            field = selection.selection[alias]
+            irbuilder.position_at_end(block)
+
             if field.resolver is not None:
                 callback_ptr, callback_ty = self._get_resolver_callback(field)
                 resolver = irbuilder.inttoptr(ir.IntType(64)(callback_ptr), callback_ty)
-                val = self._pyapi.guarded_call(
-                    irbuilder,
-                    resolver,
-                    [root, info],
-                    ret_on_err=_bool_ty(1),
-                )
+                val = irbuilder.call(resolver, [root, info])
             else:
                 resolver = self._get_default_resolver()
-                val = self._pyapi.guarded_call(
-                    irbuilder,
+                val = irbuilder.call(
                     resolver,
                     [
                         root,
-                        cstr(irbuilder, f"{field.name}\0".encode("ascii")),
+                        cstr(irbuilder, f"{field.name}\0".encode("utf-8")),
                         info,
-                        irbuilder.call(self._pyapi.PyDict_New, []),
+                        self._pyapi.PyObject(None),
                     ],
-                    ret_on_err=_bool_ty(1),
                 )
-            field_ptr = irbuilder.gep(
-                ret_struct,
-                [_i32(0), _i32(field_indices[alias])],
-                inbounds=True,
-                name=f"{alias}_ptr",
+
+            resolver_failed = irbuilder.call(
+                self._pyapi.PyErr_GivenExceptionMatches,
+                [val, irbuilder.load(self._pyapi.PyExc_BaseException)],
             )
-            if isinstance(field, ScalarField):
-                irbuilder.store(val, field_ptr)
-            elif isinstance(field, ObjectField):
-                failed = irbuilder.call(
-                    functions[alias], [field_ptr, val, info], name=f"{alias}_ok"
+            with irbuilder.if_then(resolver_failed, likely=False):
+                is_fatal_exception = irbuilder.not_(
+                    irbuilder.call(
+                        self._pyapi.PyErr_GivenExceptionMatches,
+                        [val, irbuilder.load(self._pyapi.PyExc_Exception)],
+                    ),
                 )
-                with irbuilder.if_then(failed, likely=False):
-                    irbuilder.ret(failed)
+                with irbuilder.if_then(is_fatal_exception, likely=False):
+                    self._pyapi.decref(irbuilder, result_dict)
+                    irbuilder.call(
+                        self._pyapi.PyErr_Restore,
+                        [
+                            irbuilder.call(self._pyapi.PyObject_Type, [val]),
+                            val,
+                            irbuilder.call(self._pyapi.PyException_GetTraceback, [val]),
+                        ],
+                    )
+                    irbuilder.ret(self._pyapi.PyObject(None))
+                self._pyapi.decref(irbuilder, val)
+                # FIXME: put val in errors
+                self._pyapi.guarded_call(
+                    irbuilder,
+                    self._pyapi.PyDict_SetItemString,
+                    [
+                        result_dict,
+                        cstr(irbuilder, f"{alias}\0".encode("utf-8")),
+                        self._pyapi.Py_None,
+                    ],
+                    error_sentinel=_i32(-1),
+                )
+                if field.nullable:
+                    irbuilder.branch(next_block)
+                else:
+                    self._pyapi.decref(irbuilder, result_dict)
+                    self._pyapi.incref(irbuilder, self._pyapi.Py_None)
+                    irbuilder.ret(self._pyapi.Py_None)
+
+            if isinstance(field, ScalarField):
+                self._pyapi.guarded_call(
+                    irbuilder,
+                    self._pyapi.PyDict_SetItemString,
+                    [result_dict, cstr(irbuilder, f"{alias}\0".encode("utf-8")), val],
+                    error_sentinel=_i32(-1),
+                )
+                self._pyapi.decref(irbuilder, val)
+            elif isinstance(field, ObjectField):
+                inner_result = irbuilder.call(
+                    functions[alias], [val, info], name=f"{alias}_ok"
+                )
+                self._pyapi.decref(irbuilder, val)
+                # if inner_result is NULL return NULL
+                with irbuilder.if_then(
+                    irbuilder.icmp_unsigned(
+                        "==", inner_result, inner_result.type(None)
+                    ),
+                    likely=False,
+                ):
+                    self._pyapi.decref(irbuilder, result_dict)
+                    irbuilder.ret(self._pyapi.PyObject(None))
+                self._pyapi.guarded_call(
+                    irbuilder,
+                    self._pyapi.PyDict_SetItemString,
+                    [
+                        result_dict,
+                        cstr(irbuilder, f"{alias}\0".encode("utf-8")),
+                        inner_result,
+                    ],
+                    error_sentinel=_i32(-1),
+                )
+                if not field.nullable:
+                    with irbuilder.if_then(
+                        irbuilder.icmp_unsigned(
+                            "==", inner_result, self._pyapi.Py_None
+                        ),
+                        likely=False,
+                    ):
+                        self._pyapi.incref(irbuilder, self._pyapi.Py_None)
+                        self._pyapi.decref(irbuilder, result_dict)
+                        irbuilder.ret(self._pyapi.Py_None)
             else:
                 raise NotImplementedError(field)
 
-        irbuilder.ret(_bool_ty(0))
+            irbuilder.branch(next_block)
 
-        return func, struct_ty
+        irbuilder.position_at_end(end_block)
+        irbuilder.ret(result_dict)
+
+        return func
 
     def _get_resolver_callback(self, field):
+        def wrapper(*args):
+            try:
+                return field.resolver(*args)
+            except BaseException as exc:
+                return exc
+
         # FIXME: Field arguments
         proto = ctypes.CFUNCTYPE(ctypes.py_object, ctypes.py_object, ctypes.py_object)
-        callback = proto(field.resolver)
+        callback = proto(wrapper)
         self._do_not_gc.append(callback)
-        llvm_type = ir.FunctionType(self._pyapi.PyObject, (self._pyapi.PyObject, self._pyapi.PyObject))
+        llvm_type = ir.FunctionType(
+            self._pyapi.PyObject, (self._pyapi.PyObject, self._pyapi.PyObject)
+        )
         return ctypes.cast(callback, ctypes.c_void_p).value, llvm_type.as_pointer()
 
     def _get_default_resolver(self):
@@ -355,9 +402,7 @@ class Compiler:
             likely=False,
         ):
             irbuilder.call(self._pyapi.PyErr_Clear, [])
-            none = self._pyapi.Py_None
-            irbuilder.call(self._pyapi.Py_IncRef, [none])
-            irbuilder.ret(none)
+            irbuilder.ret(val)
             irbuilder.block.name = "no_value_for_field"
 
         irbuilder.block.name = "check_is_callable"
@@ -368,12 +413,9 @@ class Compiler:
         )
         prev_block = irbuilder.block
         with irbuilder.if_then(is_callable):
-            args = self._pyapi.guarded_call(
-                irbuilder, self._pyapi.PyTuple_Pack, [ir.IntType(64)(1), info]
-            )
-            val2 = self._pyapi.guarded_call(
-                irbuilder, self._pyapi.PyObject_Call, [val, args, kwargs]
-            )
+            args = irbuilder.call(self._pyapi.PyTuple_Pack, [ir.IntType(64)(1), info])
+            # FIXME: handle errors
+            val2 = irbuilder.call(self._pyapi.PyObject_Call, [val, args, kwargs])
             then_block = irbuilder.block
             then_block.name = "call_it"
 

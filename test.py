@@ -1,6 +1,11 @@
 import gqljit
 import graphql as g
 
+
+def breakit(*args):
+    raise BaseException("yo!")
+
+
 schema = g.GraphQLSchema(
     query=g.GraphQLObjectType(
         name="Query",
@@ -11,7 +16,8 @@ schema = g.GraphQLSchema(
                     fields={
                         "Hello": g.GraphQLField(
                             g.GraphQLString,
-                            resolve=lambda root, info: root["Hello"].upper(),
+                            # resolve=lambda root, info: root["Hello"].upper(),
+                            resolve=breakit,
                         ),
                     },
                 ),
