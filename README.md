@@ -11,11 +11,11 @@ A lot.
   - [x] Functions to execute query
   - [x] Call into Python to run resolvers
     - [x] Get pointers to Python functions callable by JIT-compiled code
-  - [x] Default resolver (for scalars without defined resolvers)
+  - [x] Default resolver (for fields without defined resolvers)
   - [ ] Lists
-  - [ ] Handle nullability
+  - [x] Handle nullability
   - [ ] Promises
   - [ ] Properly increment and decrement Python object refcounts
 - [x] Invoke compiled code from Python
-- [ ] Error handling
+- [x] Error handling
 - [ ] Error reporting
