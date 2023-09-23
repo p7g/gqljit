@@ -18,4 +18,4 @@ A lot.
   - [ ] Properly increment and decrement Python object refcounts
 - [x] Invoke compiled code from Python
 - [x] Error handling
-- [ ] Error reporting
+- [x] Error reporting

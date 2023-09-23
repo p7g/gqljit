@@ -34,6 +34,7 @@ def make(ctx, mod):
         PyObject_Repr = pyapi_func("PyObject_Repr", py_obj, [py_obj])
         PyObject_Print = pyapi_func("PyObject_Print", int32, [py_obj, FILE_p, int32])
         PyObject_Type = pyapi_func("PyObject_Type", py_obj, [py_obj])
+        Py_BuildValue = pyapi_func("Py_BuildValue", py_obj, [c_str], varargs=True)
 
         PyCallable_Check = pyapi_func("PyCallable_Check", int32, [py_obj])
 
@@ -43,6 +44,8 @@ def make(ctx, mod):
         PyDict_SetItemString = pyapi_func(
             "PyDict_SetItemString", int32, [py_obj, c_str, py_obj]
         )
+
+        PyList_Append = pyapi_func("PyList_Append", int32, [py_obj, py_obj])
 
         PyUnicode_AsEncodedString = pyapi_func(
             "PyUnicode_AsEncodedString", py_obj, [py_obj, c_str, c_str]

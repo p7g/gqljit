@@ -130,7 +130,7 @@ class JITExecutionContext(ExecutionContext):
         )
         compiler = Compiler()
         resolver = compiler.compile(selection)
-        return resolver(source_value, None)
+        return resolver(source_value, None, self.errors)
 
 
 class Compiler:
@@ -148,15 +148,10 @@ class Compiler:
 
     def compile(self, query: ObjectField):
         pyfunc = self._compile(query)
-        # print(self.llvm_ir)
+        # print(self.llvm_ir())
         # print(self.asm())
         return pyfunc
 
-    @property
-    def engine(self):
-        return self._engine
-
-    @property
     def llvm_ir(self) -> str:
         return str(self._module)
 
@@ -174,7 +169,7 @@ class Compiler:
 
     # FIXME: maintain path to where we're at for compilation error reporting
     def _compile(self, query: ObjectField):
-        top_func = self._compile_selection("query", query)
+        top_func = self._compile_selection("query", query, ("query",))
         self.finalize()
 
         execute_func_ptr = self._engine.get_function_address(top_func.name)
@@ -182,33 +177,37 @@ class Compiler:
             ctypes.py_object,
             ctypes.py_object,
             ctypes.py_object,
+            ctypes.py_object,
         )(execute_func_ptr)
 
-        def wrapper(root, info, *args, **kwargs):
-            return adapter(root, info)
+        def wrapper(root, info, errors, *args, **kwargs):
+            return adapter(root, info, errors)
 
         return wrapper
 
-    def _compile_selection(self, outer_alias: str, selection: ObjectField):
+    def _compile_selection(
+        self, outer_alias: str, selection: ObjectField, path: tuple[int | str, ...]
+    ):
         functions = {}
 
         for alias, field in selection.selection.items():
             if isinstance(field, ScalarField):
                 pass
             elif isinstance(field, ObjectField):
-                functions[alias] = self._compile_selection(alias, field)
+                functions[alias] = self._compile_selection(alias, field, (*path, alias))
             else:
                 raise NotImplementedError(field)
 
         func_ty = ir.FunctionType(
             self._pyapi.PyObject,
-            (self._pyapi.PyObject, self._pyapi.PyObject),
+            (self._pyapi.PyObject, self._pyapi.PyObject, self._pyapi.PyObject),
         )
         func = ir.Function(self._module, func_ty, f"execute_{outer_alias}")
         irbuilder = ir.IRBuilder(func.append_basic_block("entry"))
-        root, info = func.args
+        root, info, errors = func.args
         root.name = "root"
         info.name = "info"
+        errors.name = "errors"
 
         aliases = list(selection.selection)
         alias_blocks = {alias: irbuilder.append_basic_block(alias) for alias in aliases}
@@ -265,8 +264,47 @@ class Compiler:
                         ],
                     )
                     irbuilder.ret(self._pyapi.PyObject(None))
+
+                (
+                    located_error_func,
+                    located_error_ty,
+                ) = self._get_graphql_core_located_error_fn()
+
+                path_fmt = "".join(
+                    "s" if isinstance(part, str) else "l" for part in path
+                )
+                path_llvm_parts = [
+                    cstr(irbuilder, f"{part}\0".encode("utf-8"))
+                    if isinstance(part, str)
+                    else ir.IntType(64)(part)
+                    for part in path
+                ]
+                path_sequence = self._pyapi.guarded_call(
+                    irbuilder,
+                    self._pyapi.Py_BuildValue,
+                    [
+                        cstr(irbuilder, f"({path_fmt})\0".encode("ascii")),
+                        *path_llvm_parts,
+                    ],
+                )
+
+                self._pyapi.incref(irbuilder, self._pyapi.Py_None)
+                located_error = irbuilder.call(
+                    irbuilder.inttoptr(
+                        ir.IntType(64)(located_error_func), located_error_ty
+                    ),
+                    [val, self._pyapi.Py_None, path_sequence],
+                )
                 self._pyapi.decref(irbuilder, val)
-                # FIXME: put val in errors
+                self._pyapi.decref(irbuilder, path_sequence)
+
+                self._pyapi.guarded_call(
+                    irbuilder,
+                    self._pyapi.PyList_Append,
+                    [errors, located_error],
+                    error_sentinel=_i32(-1),
+                )
+
                 self._pyapi.guarded_call(
                     irbuilder,
                     self._pyapi.PyDict_SetItemString,
@@ -294,7 +332,7 @@ class Compiler:
                 self._pyapi.decref(irbuilder, val)
             elif isinstance(field, ObjectField):
                 inner_result = irbuilder.call(
-                    functions[alias], [val, info], name=f"{alias}_ok"
+                    functions[alias], [val, info, errors], name=f"{alias}_ok"
                 )
                 self._pyapi.decref(irbuilder, val)
                 # if inner_result is NULL return NULL
@@ -325,7 +363,9 @@ class Compiler:
                     ):
                         self._pyapi.incref(irbuilder, self._pyapi.Py_None)
                         self._pyapi.decref(irbuilder, result_dict)
+                        self._pyapi.decref(irbuilder, inner_result)
                         irbuilder.ret(self._pyapi.Py_None)
+                self._pyapi.decref(irbuilder, inner_result)
             else:
                 raise NotImplementedError(field)
 
@@ -335,6 +375,25 @@ class Compiler:
         irbuilder.ret(result_dict)
 
         return func
+
+    def _get_graphql_core_located_error_fn(self):
+        if hasattr(self, "_graphql_core_located_error"):
+            func, ty = self._graphql_core_located_error
+        else:
+            from graphql.error import located_error
+
+            proto = ctypes.PYFUNCTYPE(
+                ctypes.py_object, ctypes.py_object, ctypes.py_object, ctypes.py_object
+            )
+            func = proto(located_error)
+            ty = ir.FunctionType(
+                self._pyapi.PyObject,
+                [self._pyapi.PyObject, self._pyapi.PyObject, self._pyapi.PyObject],
+            ).as_pointer()
+            self._do_not_gc.append(func)
+            self._graphql_core_located_error = func, ty
+
+        return ctypes.cast(func, ctypes.c_void_p).value, ty
 
     def _get_resolver_callback(self, field):
         def wrapper(*args):
